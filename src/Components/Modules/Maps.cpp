@@ -5,6 +5,9 @@
 #include "StartupMessages.hpp"
 #include "Theatre.hpp"
 #include "GSC/Script.hpp"
+#include <filesystem>
+#include <mutex>
+#include <unordered_map>
 
 namespace Components
 {
@@ -483,25 +486,62 @@ namespace Components
   }
 
   unsigned int Maps::GetUsermapHash(const std::string& map)
-  {
-    if (Utils::IO::DirectoryExists(std::format("usermaps/{}", map)))
-    {
-      std::string hash;
+{
+	if (Utils::IO::DirectoryExists(std::format("usermaps/{}", map)))
+	{
+		// Hashing the usermap files takes tens of seconds, so remember the
+		// result and reuse it while the files are unchanged (size + write time).
+		struct CachedHash
+		{
+			std::string signature;
+			unsigned int hash;
+		};
+		static std::unordered_map<std::string, CachedHash> cache;
+		static std::mutex cacheMutex;
 
-      for (std::size_t i = 0; i < ARRAYSIZE(Maps::UserMapFiles); ++i)
-      {
-        auto filePath = std::format("usermaps/{}/{}{}", map, map, Maps::UserMapFiles[i]);
-        if (Utils::IO::FileExists(filePath))
-        {
-          hash.append(Utils::Cryptography::SHA256::Compute(Utils::IO::ReadFile(filePath)));
-        }
-      }
+		std::vector<std::string> files;
+		std::string signature;
 
-      return Utils::Cryptography::JenkinsOneAtATime::Compute(hash);
-    }
+		for (std::size_t i = 0; i < ARRAYSIZE(Maps::UserMapFiles); ++i)
+		{
+			auto filePath = std::format("usermaps/{}/{}{}", map, map, Maps::UserMapFiles[i]);
+			if (Utils::IO::FileExists(filePath))
+			{
+				std::error_code ec;
+				const auto size = std::filesystem::file_size(filePath, ec);
+				const auto time = std::filesystem::last_write_time(filePath, ec).time_since_epoch().count();
+				signature.append(std::format("{}|{}|{};", filePath, size, time));
+				files.push_back(filePath);
+			}
+		}
 
-    return 0;
-  }
+		{
+			std::lock_guard<std::mutex> _(cacheMutex);
+			const auto itr = cache.find(map);
+			if (itr != cache.end() && itr->second.signature == signature)
+			{
+				return itr->second.hash;
+			}
+		}
+
+		std::string hash;
+		for (const auto& filePath : files)
+		{
+			hash.append(Utils::Cryptography::SHA256::Compute(Utils::IO::ReadFile(filePath)));
+		}
+
+		const auto result = Utils::Cryptography::JenkinsOneAtATime::Compute(hash);
+
+		{
+			std::lock_guard<std::mutex> _(cacheMutex);
+			cache[map] = { signature, result };
+		}
+
+		return result;
+	}
+
+	return 0;
+}
 
   void Maps::LoadNewMapCommand(char* buffer, size_t size, const char* /*format*/, const char* mapname, const char* gametype)
   {
