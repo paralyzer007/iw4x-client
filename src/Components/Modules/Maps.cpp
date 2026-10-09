@@ -7,6 +7,8 @@
 #include "GSC/Script.hpp"
 #include <filesystem>
 #include <mutex>
+#include <optional>
+#include <stop_token>
 #include <unordered_map>
 
 namespace Components
@@ -485,67 +487,311 @@ namespace Components
     }
   }
 
+  // BEGIN usermap hash cache
+  namespace
+  {
+    // Hashing a usermap means reading every byte of its files. That takes
+    // seconds on an SSD and tens of seconds on a hard disk, and it runs on the
+    // main thread in the middle of a map change, so everybody on the server
+    // sits frozen while it happens.
+    //
+    // The result only changes when the files do. So we remember it per map,
+    // keyed by the size and write time of each file, and keep that on disk so
+    // it survives restarts. A dedicated server also fills in whatever is
+    // missing in the background right after it starts, which means a map
+    // change normally never has to hash anything.
+    //
+    struct UsermapHashEntry
+    {
+      std::string signature;
+      unsigned int hash;
+    };
+
+    constexpr auto* UsermapHashCacheFile = "usermaps/hashcache.txt";
+    constexpr auto* UsermapHashCacheTempFile = "usermaps/hashcache.tmp";
+
+    std::mutex UsermapHashMutex;
+    std::unordered_map<std::string, UsermapHashEntry> UsermapHashCache;
+    bool UsermapHashCacheLoaded = false;
+
+    // Keep this one last so that it is stopped and joined before the state
+    // above goes away.
+    //
+    std::jthread UsermapHashWarmupThread;
+
+    // Note that the caller must hold the mutex.
+    //
+    void LoadUsermapHashCache()
+    {
+      if (UsermapHashCacheLoaded)
+      {
+        return;
+      }
+
+      UsermapHashCacheLoaded = true;
+
+      // One map per line: name, hash, signature. Anything that does not parse
+      // is skipped, which only costs us a rehash of that map.
+      //
+      std::ifstream stream(UsermapHashCacheFile, std::ios::binary);
+      std::string line;
+      while (stream.is_open() && std::getline(stream, line))
+      {
+        if (!line.empty() && line.back() == '\r')
+        {
+          line.pop_back();
+        }
+
+        const auto first = line.find('\t');
+        const auto second = first == std::string::npos ? first : line.find('\t', first + 1);
+        if (first == std::string::npos || second == std::string::npos || first == 0)
+        {
+          continue;
+        }
+
+        const auto name = line.substr(0, first);
+        const auto value = line.substr(first + 1, second - first - 1);
+        auto signature = line.substr(second + 1);
+
+        if (value.empty() || signature.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+        {
+          continue;
+        }
+
+        const auto parsed = std::strtoull(value.data(), nullptr, 10);
+        if (parsed > 0xFFFFFFFFull)
+        {
+          continue;
+        }
+
+        UsermapHashCache[name] = { std::move(signature), static_cast<unsigned int>(parsed) };
+      }
+    }
+
+    // Note that the caller must hold the mutex.
+    //
+    void SaveUsermapHashCache()
+    {
+      // Write a new file and swap it in, so that being killed halfway leaves
+      // the previous cache intact rather than a truncated one.
+      //
+      {
+        std::ofstream stream(UsermapHashCacheTempFile, std::ios::binary | std::ios::trunc);
+        if (!stream.is_open())
+        {
+          return;
+        }
+
+        for (const auto& [name, entry] : UsermapHashCache)
+        {
+          stream << name << '\t' << entry.hash << '\t' << entry.signature << '\n';
+        }
+
+        stream.flush();
+        if (!stream.good())
+        {
+          return;
+        }
+      }
+
+      MoveFileExA(UsermapHashCacheTempFile, UsermapHashCacheFile, MOVEFILE_REPLACE_EXISTING);
+    }
+
+    // Describe the current state of the map's files. An empty optional means
+    // we could not tell, in which case the result must not be cached.
+    //
+    std::optional<std::string> GetUsermapSignature(const std::string& map)
+    {
+      std::string signature;
+
+      for (std::size_t i = 0; i < ARRAYSIZE(Maps::UserMapFiles); ++i)
+      {
+        const auto filePath = std::format("usermaps/{}/{}{}", map, map, Maps::UserMapFiles[i]);
+        if (!Utils::IO::FileExists(filePath))
+        {
+          continue;
+        }
+
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(filePath, ec);
+        if (ec)
+        {
+          return {};
+        }
+
+        const auto writeTime = std::filesystem::last_write_time(filePath, ec);
+        if (ec)
+        {
+          return {};
+        }
+
+        signature.append(std::format("{}:{}:{};", i, size, writeTime.time_since_epoch().count()));
+      }
+
+      return signature;
+    }
+
+    // Append the SHA-256 of the file to the output, reading it in pieces
+    // rather than pulling the whole thing into memory. The digest is the same
+    // as hashing the file contents in one go, which is what other clients do.
+    //
+    bool AppendUsermapFileHash(const std::string& filePath, std::string& output, const std::stop_token& stop)
+    {
+      hash_state state;
+      sha256_init(&state);
+
+      std::ifstream stream(filePath, std::ios::binary);
+      if (stream.is_open())
+      {
+        std::vector<char> buffer(1024 * 1024);
+        while (stream.good())
+        {
+          if (stop.stop_requested())
+          {
+            return false;
+          }
+
+          stream.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+          const auto count = stream.gcount();
+          if (count > 0)
+          {
+            sha256_process(&state, reinterpret_cast<const std::uint8_t*>(buffer.data()), static_cast<unsigned long>(count));
+          }
+        }
+      }
+
+      std::uint8_t digest[32]{};
+      sha256_done(&state, digest);
+
+      output.append(reinterpret_cast<const char*>(digest), sizeof(digest));
+      return true;
+    }
+
+    bool IsCacheableUsermapName(const std::string& map)
+    {
+      return !map.empty() && std::ranges::none_of(map, [](const unsigned char c) { return c < 0x20 || c == 0x7F; });
+    }
+
+    // An empty optional means the hash was abandoned because we were asked to
+    // stop, which only ever happens on the warm-up thread.
+    //
+    std::optional<unsigned int> ResolveUsermapHash(const std::string& map, const std::stop_token& stop, bool* computed = nullptr)
+    {
+      const auto signature = GetUsermapSignature(map);
+      const auto cacheable = signature.has_value() && IsCacheableUsermapName(map);
+
+      if (cacheable)
+      {
+        std::lock_guard _(UsermapHashMutex);
+        LoadUsermapHashCache();
+
+        const auto itr = UsermapHashCache.find(map);
+        if (itr != UsermapHashCache.end() && itr->second.signature == *signature)
+        {
+          return itr->second.hash;
+        }
+      }
+
+      std::string hashes;
+      for (std::size_t i = 0; i < ARRAYSIZE(Maps::UserMapFiles); ++i)
+      {
+        const auto filePath = std::format("usermaps/{}/{}{}", map, map, Maps::UserMapFiles[i]);
+        if (Utils::IO::FileExists(filePath) && !AppendUsermapFileHash(filePath, hashes, stop))
+        {
+          return {};
+        }
+      }
+
+      const auto result = static_cast<unsigned int>(Utils::Cryptography::JenkinsOneAtATime::Compute(hashes));
+      if (computed)
+      {
+        *computed = true;
+      }
+
+      // Only remember the result if the files did not change while we were
+      // reading them, e.g. because the map was still being copied in.
+      //
+      if (cacheable && GetUsermapSignature(map) == signature)
+      {
+        std::lock_guard _(UsermapHashMutex);
+        UsermapHashCache[map] = { *signature, result };
+        SaveUsermapHashCache();
+      }
+
+      return result;
+    }
+
+    void WarmUpUsermapHashes(const std::stop_token& stop)
+    {
+      // Background mode lowers our disk priority as well, so that we do not
+      // compete with the game for a slow disk.
+      //
+      SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+
+      try
+      {
+        std::error_code ec;
+        for (std::filesystem::directory_iterator itr("usermaps", ec), last; !ec && itr != last; itr.increment(ec))
+        {
+          if (stop.stop_requested())
+          {
+            break;
+          }
+
+          std::error_code entryEc;
+          if (itr->is_directory(entryEc) && !entryEc)
+          {
+            ResolveUsermapHash(itr->path().filename().string(), stop);
+          }
+        }
+      }
+      catch (...)
+      {
+        // This is only an optimization. Whatever we did not get to is hashed
+        // when the map is loaded, the way it always was.
+      }
+
+      SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+    }
+  }
+
   unsigned int Maps::GetUsermapHash(const std::string& map)
-{
-	if (Utils::IO::DirectoryExists(std::format("usermaps/{}", map)))
-	{
-		// Hashing the usermap files takes tens of seconds, so remember the
-		// result and reuse it while the files are unchanged (size + write time).
-		struct CachedHash
-		{
-			std::string signature;
-			unsigned int hash;
-		};
-		static std::unordered_map<std::string, CachedHash> cache;
-		static std::mutex cacheMutex;
+  {
+    if (Utils::IO::DirectoryExists(std::format("usermaps/{}", map)))
+    {
+      const auto start = std::chrono::steady_clock::now();
 
-		std::vector<std::string> files;
-		std::string signature;
+      bool computed = false;
+      const auto hash = ResolveUsermapHash(map, {}, &computed).value_or(0u);
 
-		for (std::size_t i = 0; i < ARRAYSIZE(Maps::UserMapFiles); ++i)
-		{
-			auto filePath = std::format("usermaps/{}/{}{}", map, map, Maps::UserMapFiles[i]);
-			if (Utils::IO::FileExists(filePath))
-			{
-				std::error_code ec;
-				const auto size = std::filesystem::file_size(filePath, ec);
-				const auto time = std::filesystem::last_write_time(filePath, ec).time_since_epoch().count();
-				signature.append(std::format("{}|{}|{};", filePath, size, time));
-				files.push_back(filePath);
-			}
-		}
+      if (computed)
+      {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+        Logger::Print("Hashed usermap {} in {}ms\n", map, elapsed.count());
+      }
 
-		{
-			std::lock_guard<std::mutex> _(cacheMutex);
-			const auto itr = cache.find(map);
-			if (itr != cache.end() && itr->second.signature == signature)
-			{
-				return itr->second.hash;
-			}
-		}
+      return hash;
+    }
 
-		std::string hash;
-		for (const auto& filePath : files)
-		{
-			hash.append(Utils::Cryptography::SHA256::Compute(Utils::IO::ReadFile(filePath)));
-		}
+    return 0;
+  }
+  // END usermap hash cache
 
-		const auto result = Utils::Cryptography::JenkinsOneAtATime::Compute(hash);
-
-		{
-			std::lock_guard<std::mutex> _(cacheMutex);
-			cache[map] = { signature, result };
-		}
-
-		return result;
-	}
-
-	return 0;
-}
+  namespace
+  {
+    Dvar::Var SVSkipUsermapHashOnRotate;
+  }
 
   void Maps::LoadNewMapCommand(char* buffer, size_t size, const char* /*format*/, const char* mapname, const char* gametype)
   {
-    unsigned int hash = Maps::GetUsermapHash(mapname);
+    // A client that is told the hash of the next usermap hashes its own copy
+    // to compare, with its screen frozen, and then hashes it a second time when
+    // it loads the map. A hash of 0 makes it skip the comparison. It still
+    // reconnects to download a map it does not have at all, and its copy is
+    // still compared with ours whenever it joins. What is lost is only the
+    // redownload of a changed map for players who are already on the server.
+    //
+    unsigned int hash = SVSkipUsermapHashOnRotate.get<bool>() ? 0 : Maps::GetUsermapHash(mapname);
     _snprintf_s(buffer, size, _TRUNCATE, "loadingnewmap\n%s\n%s\n%d", mapname, gametype, hash);
   }
 
@@ -902,6 +1148,7 @@ namespace Components
       {
         Dvar::Register<bool>("isDlcInstalled_All", false, Game::DVAR_EXTERNAL | Game::DVAR_INIT, "");
         Maps::RListSModels = Dvar::Register<bool>("r_listSModels", false, Game::DVAR_NONE, "Display a list of visible SModels");
+        SVSkipUsermapHashOnRotate = Dvar::Register<bool>("sv_skipUsermapHashOnRotate", false, Game::DVAR_NONE, "Do not send the usermap hash on a map change, so clients skip comparing their copy");
 
         Maps::AddDlc({ 1, "Stimulus Pack", {"mp_complex", "mp_compact", "mp_storm", "mp_overgrown", "mp_crash"} });
         Maps::AddDlc({ 2, "Resurgence Pack", {"mp_abandon", "mp_vacant", "mp_trailerpark", "mp_strike", "mp_fuel2"} });
@@ -987,6 +1234,9 @@ namespace Components
     if (Dedicated::IsEnabled())
     {
       Utils::Hook(0x4A7251, Maps::LoadNewMapCommand, HOOK_CALL).install()->quick();
+
+      // Hash whatever usermaps are not in the cache yet, off the main thread.
+      UsermapHashWarmupThread = std::jthread([](const std::stop_token stop) { WarmUpUsermapHashes(stop); });
     }
 
     // Download the map before a map rotation if necessary
